@@ -1,0 +1,345 @@
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+import pandas as pd
+import os
+import threading
+import queue
+import pickle
+import time
+
+# Print the current working directory
+print("Current working directory:", os.getcwd())
+
+# Load the model and tokenizer
+model_name = "mistralai/Mistral-7B-Instruct-v0.1"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+
+# Check if GPU is available and use it if possible
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+
+# Timeout exception
+class TimeoutException(Exception):
+    pass
+
+
+def generate_with_timeout(prompt, timeout_seconds=1200):
+    """
+    Generates output with a timeout using threading.
+    Returns (output, status) tuple.
+    """
+    result_queue = queue.Queue()
+
+    def generation_worker():
+        try:
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=128,
+                do_sample=False,        # Deterministic: always pick most likely token
+                temperature=0,          # Reinforces deterministic behavior
+                num_beams=1,            # Disables beam search (faster)
+                top_p=1.0,              # Ensures deterministic sampling
+                top_k=0                 # Disables top-k filtering
+            )
+            decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            result_queue.put(("success", decoded_output))
+
+        except Exception as e:
+            result_queue.put(("error", str(e)))
+
+    # Start generation in a separate thread
+    worker_thread = threading.Thread(target=generation_worker)
+    worker_thread.start()
+    worker_thread.join(timeout=timeout_seconds)
+
+    # Check if thread is still alive (timeout occurred)
+    if worker_thread.is_alive():
+        return None, "timeout"
+
+    # Get result from queue
+    try:
+        status, result = result_queue.get_nowait()
+        return result, status
+    except queue.Empty:
+        return None, "timeout"
+
+
+def analyze_author_topic_pairing(comment1, comment2, topic1, topic2, timeout_seconds=1200):
+    """
+    Analyzes whether two comments are from the same author and whether they discuss the same topic.
+    Returns a tuple of (analysis_result, status).
+    """
+    # Create a prompt for the model to assess author and topic consistency
+    prompt = f"""Analyze the following two comments and determine:
+1. Are these comments likely written by the same author? (Consider writing style, vocabulary, tone)
+2. Do these comments discuss the same topic or subreddit?
+
+Comment 1 (Topic: {topic1}): {comment1}
+
+Comment 2 (Topic: {topic2}): {comment2}
+
+Respond with:
+- Same Author: Yes/No
+- Same Topic: Yes/No
+- Confidence (High/Medium/Low)
+- Brief explanation"""
+
+    return generate_with_timeout(prompt, timeout_seconds)
+
+
+def load_xslx(file_path):
+    """
+    Load an Excel file and return as a pandas DataFrame.
+    """
+    print(f"Attempting to load XSLX file from: {file_path}")
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
+        return None
+    df = pd.read_excel(file_path)
+    return df
+
+
+# ============= CHECKPOINT FUNCTIONS =============
+
+def save_checkpoint(checkpoint_path, results, skipped_rows, successful_rows, last_processed_index):
+    """
+    Save progress to a checkpoint file.
+    """
+    checkpoint_data = {
+        'results': results,
+        'skipped_rows': skipped_rows,
+        'successful_rows': successful_rows,
+        'last_processed_index': last_processed_index
+    }
+    try:
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump(checkpoint_data, f)
+        print(f"✓ Checkpoint saved at row {last_processed_index + 1}")
+    except Exception as e:
+        print(f"⚠️  Failed to save checkpoint: {e}")
+
+
+def load_checkpoint(checkpoint_path):
+    """
+    Load progress from a checkpoint file.
+    Returns (results, skipped_rows, successful_rows, last_processed_index) or None if no checkpoint exists.
+    """
+    if not os.path.exists(checkpoint_path):
+        return None
+
+    try:
+        with open(checkpoint_path, 'rb') as f:
+            checkpoint_data = pickle.load(f)
+        print(f"✓ Checkpoint loaded! Resuming from row {checkpoint_data['last_processed_index'] + 2}")
+        return (checkpoint_data['results'],
+                checkpoint_data['skipped_rows'],
+                checkpoint_data['successful_rows'],
+                checkpoint_data['last_processed_index'])
+    except Exception as e:
+        print(f"⚠️  Failed to load checkpoint: {e}")
+        return None
+
+
+# Example usage
+if __name__ == "__main__":
+    # ============= BATCH PROCESSING CONFIGURATION =============
+    # Set ONE of these batch limits (the script will stop when either limit is reached)
+
+    BATCH_ROW_LIMIT = 100  # Stop after processing 100 rows (set to None to disable)
+    BATCH_TIME_LIMIT_MINUTES = None  # Stop after X minutes (set to None to disable)
+
+    # Convert time limit to seconds
+    BATCH_TIME_LIMIT_SECONDS = BATCH_TIME_LIMIT_MINUTES * 60 if BATCH_TIME_LIMIT_MINUTES else None
+
+    CHECKPOINT_SAVE_FREQUENCY = 5  # Save checkpoint every 5 rows
+
+    # Load Excel file using relative path
+    file_path = os.path.join("text_pairs_for_authorship_verification", "december_2025", "dast_1000.xlsx")
+    df = load_xslx(file_path)
+
+    if df is not None:
+        # Create column aliases for privacy and clarity
+        # Columns: A-B are usernames, C-D are topics/subreddits, E-F are comments
+        column_mapping = {
+            'A': 'username_1',
+            'B': 'username_2',
+            'C': 'topic_1',
+            'D': 'topic_2',
+            'E': 'comment_1',
+            'F': 'comment_2'
+        }
+
+        # Rename columns based on mapping
+        df = df.rename(columns=dict(zip(df.columns, column_mapping.values())))
+
+        print(f"Loaded {len(df)} rows for analysis")
+        print("---")
+        print(f"BATCH CONFIGURATION:")
+        print(f"  Row limit: {BATCH_ROW_LIMIT if BATCH_ROW_LIMIT else 'Unlimited'}")
+        print(f"  Time limit: {BATCH_TIME_LIMIT_MINUTES} minutes" if BATCH_TIME_LIMIT_MINUTES else "  Time limit: Unlimited")
+        print("---\n")
+
+        # ============= CHECKPOINT LOADING =============
+        checkpoint_path = os.path.join("text_pairs_for_authorship_verification", "december_2025", "checkpoint.pkl")
+        checkpoint_info = load_checkpoint(checkpoint_path)
+
+        if checkpoint_info:
+            results, skipped_rows, successful_rows, last_processed_index = checkpoint_info
+            start_index = last_processed_index + 1
+        else:
+            results = []
+            skipped_rows = []
+            successful_rows = 0
+            start_index = 0
+
+        print(f"Starting from row {start_index + 1}/{len(df)}")
+        print("---\n")
+
+        # ============= BATCH PROCESSING LOOP =============
+        batch_start_time = time.time()
+        rows_processed_in_batch = 0
+        batch_complete = False
+
+        for index in range(start_index, len(df)):
+            # ============= CHECK BATCH LIMITS =============
+            # Check row limit
+            if BATCH_ROW_LIMIT and rows_processed_in_batch >= BATCH_ROW_LIMIT:
+                print(f"\n⏸️  BATCH LIMIT REACHED: {BATCH_ROW_LIMIT} rows processed")
+                batch_complete = True
+                break
+
+            # Check time limit
+            if BATCH_TIME_LIMIT_SECONDS:
+                elapsed_time = time.time() - batch_start_time
+                if elapsed_time >= BATCH_TIME_LIMIT_SECONDS:
+                    print(f"\n⏸️  TIME LIMIT REACHED: {BATCH_TIME_LIMIT_MINUTES} minutes elapsed")
+                    batch_complete = True
+                    break
+
+            row = df.iloc[index]
+            username_1 = row['username_1']
+            username_2 = row['username_2']
+            topic_1 = row['topic_1']
+            topic_2 = row['topic_2']
+            comment_1 = row['comment_1']
+            comment_2 = row['comment_2']
+
+            # ============= VALIDATE DATA =============
+            # Check for missing or null values
+            if pd.isna(comment_1) or pd.isna(comment_2) or pd.isna(username_1) or pd.isna(username_2):
+                print(f"Row {index + 1}:")
+                print(f"⚠️  SKIPPED - Row contains missing data (null/NaN values)")
+                skipped_rows.append({
+                    'row': index + 1,
+                    'reason': 'missing_data'
+                })
+                results.append({
+                    'row': index + 1,
+                    'status': 'skipped_missing_data',
+                    'analysis': '[SKIPPED - Missing Data]'
+                })
+                save_checkpoint(checkpoint_path, results, skipped_rows, successful_rows, index)
+                rows_processed_in_batch += 1
+                print("---\n")
+                continue  # Skip this row and move to the next one
+
+            # Convert to strings to handle any edge cases
+            comment_1 = str(comment_1)[:1000]
+            comment_2 = str(comment_2)[:1000]
+            username_1 = str(username_1)
+            username_2 = str(username_2)
+
+            print(f"Row {index + 1}:")
+            print(f"Author 1 (anon): {username_1[:3]}***")
+            print(f"Author 2 (anon): {username_2[:3]}***")
+            print(f"Topic 1: {topic_1}")
+            print(f"Topic 2: {topic_2}")
+            print(f"Comment 1: {comment_1[:100]}...")
+            print(f"Comment 2: {comment_2[:100]}...")
+
+            # Analyze the pairing with timeout handling
+            analysis_result, status = analyze_author_topic_pairing(
+                comment_1, comment_2, topic_1, topic_2, timeout_seconds=1200
+            )
+
+            if status == "success":
+                print(f"Analysis Result:")
+                print(analysis_result)
+                successful_rows += 1
+                results.append({
+                    'row': index + 1,
+                    'status': 'completed',
+                    'analysis': analysis_result
+                })
+            else:
+                print(f"⚠️  SKIPPED - Status: {status}")
+                skipped_rows.append({
+                    'row': index + 1,
+                    'reason': status
+                })
+                results.append({
+                    'row': index + 1,
+                    'status': status,
+                    'analysis': '[SKIPPED]'
+                })
+
+            print("---")
+
+            rows_processed_in_batch += 1
+
+            # ============= SAVE CHECKPOINT EVERY FEW ROWS =============
+            if rows_processed_in_batch % CHECKPOINT_SAVE_FREQUENCY == 0:
+                save_checkpoint(checkpoint_path, results, skipped_rows, successful_rows, index)
+
+        # Ensure checkpoint is saved at end of batch
+        save_checkpoint(checkpoint_path, results, skipped_rows, successful_rows, index)
+
+        # ============= PRINT BATCH SUMMARY =============
+        print("\n" + "="*50)
+        if batch_complete:
+            print(f"BATCH PROCESSING PAUSED")
+            print(f"Rows processed in this batch: {rows_processed_in_batch}")
+            print(f"Total rows processed overall: {index + 1}/{len(df)}")
+            print(f"Successful rows: {successful_rows}/{index + 1}")
+            print(f"Skipped rows: {len(skipped_rows)}/{index + 1}")
+            print(f"\nCheckpoint saved. Run the script again to continue.")
+        else:
+            print(f"PROCESSING COMPLETE")
+            print(f"Successful rows: {successful_rows}/{len(df)}")
+            print(f"Skipped rows: {len(skipped_rows)}/{len(df)}")
+
+        if skipped_rows:
+            print("\nSkipped row details:")
+            for skipped in skipped_rows:
+                print(f"  Row {skipped['row']}: {skipped['reason']}")
+
+        # ============= CLEAN UP CHECKPOINT AFTER SUCCESS =============
+        if not batch_complete and os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+            print(f"\nCheckpoint file removed after successful completion.")
+        elif batch_complete and os.path.exists(checkpoint_path):
+            print(f"\nCheckpoint file preserved for resumption.")
+
+        print("="*50 + "\n")
+
+        # Save results to Excel file
+        results_df = pd.DataFrame(results)
+        results_output_path = os.path.join("text_pairs_for_authorship_verification", "december_2025", "dast_1000_results.xlsx")
+        results_df.to_excel(results_output_path, index=False)
+        print(f"Results saved to: {results_output_path}")
+
+        # Save skipped rows log
+        if skipped_rows:
+            skipped_df = pd.DataFrame(skipped_rows)
+            skipped_output_path = os.path.join("text_pairs_for_authorship_verification", "december_2025", "dast_1000_skipped.xlsx")
+            skipped_df.to_excel(skipped_output_path, index=False)
+            print(f"Skipped rows log saved to: {skipped_output_path}")
+    else:
+        print("Failed to load file. Exiting.")
